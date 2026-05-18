@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SATELLITE PRIMAL LOGIC INFERENCE CORE (v1.2.0).
+"""SATELLITE PRIMAL LOGIC INFERENCE CORE (v1.3.0).
 
 Closed-loop bounded inference simulator with dynamic inference-state feedback.
 Includes Pandas rolling-window analytics for column X and plotting.
@@ -52,6 +52,7 @@ class RuntimeState:
     integral_theta: float = 0.0
     integral_A: float = 0.0
     prev_error_theta: float = 0.0
+    theta_rate: float = 0.0
 
 
 def saturate(x: float) -> float:
@@ -91,13 +92,34 @@ def coherence_control(rho: float, rho_star: float, g: float = 0.9) -> float:
     return float(g * max(rho_star - rho, 0.0))
 
 
-def update_inference_state(I_prev: float, R: float, gamma_field: float, B: float, dt: float,
-                           alpha: float = 0.35, beta: float = 0.55, delta: float = 0.12) -> float:
-    """Dynamic inference-state equation.
+def update_inference_state(
+    I_prev: float,
+    R: float,
+    gamma_field: float,
+    B: float,
+    theta_rate: float,
+    t: int,
+    dt: float,
+    alpha: float = 0.30,
+    beta: float = 0.40,
+    eta: float = 0.15,
+    delta: float = 0.10,
+    kappa_nl: float = 0.20,
+    omega: float = 0.35,
+) -> float:
+    """Dynamic inference-state equation with phase and nonlinear gating.
 
-    dI/dt = alpha*R + beta*gamma_field*B - delta*I
+    dI/dt = alpha*R + beta*gamma*B + eta*dtheta/dt + kappa_nl*sin(omega*t)*cos(B*R) - delta*I
     """
-    dI = alpha * R + beta * gamma_field * B - delta * I_prev
+    spectral_drive = np.sin(omega * t)
+    nonlinear_gate = np.cos(B * R)
+    dI = (
+        alpha * R
+        + beta * gamma_field * B
+        + eta * theta_rate
+        + kappa_nl * spectral_drive * nonlinear_gate
+        - delta * I_prev
+    )
     return float(I_prev + dI * dt)
 
 
@@ -126,8 +148,13 @@ def step(state: RuntimeState, t: int, dt: float = 0.1, kappa: float = 0.2) -> Di
     # Gamma modulation (non-destructive).
     gamma_field = g * np.exp(-0.2 * r_pre)
 
-    # Inference state dynamics (new layer).
-    state.I_state = update_inference_state(state.I_state, r_pre, gamma_field, state.B, dt)
+    # Phase derivative channel contributes to inference-state richness.
+    state.theta_rate = (state.theta_star - state.theta) / max(dt, 1e-9)
+
+    # Inference state dynamics with phase + spectral gating.
+    state.I_state = update_inference_state(
+        state.I_state, r_pre, gamma_field, state.B, state.theta_rate, t, dt
+    )
 
     # Closed-loop control injection from inference state.
     c = saturate(u_theta + u_A + u_rho + kappa * state.I_state)
@@ -153,6 +180,7 @@ def step(state: RuntimeState, t: int, dt: float = 0.1, kappa: float = 0.2) -> Di
         "raw": float(raw),
         "inference": float(inference),
         "theta": float(state.theta),
+        "theta_rate": float(state.theta_rate),
         "A": float(state.A),
         "rho": float(state.rho),
         "state_norm": float(state.state_norm),
