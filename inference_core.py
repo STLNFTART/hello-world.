@@ -1,166 +1,244 @@
 #!/usr/bin/env python3
-"""inference_core.py
+"""SATELLITE PRIMAL LOGIC INFERENCE CORE (v1.1.0).
 
-v1.0.0 - Unified, bounded inference engine for satellite-coherence-style control.
+One-file executable module for a bounded, closed-loop inference simulation with:
+1) gamma-field stabilization,
+2) phase-lock PID control,
+3) amplitude + coherence regulation,
+4) semantic gate,
+5) bounded inference manifold,
+6) pandas rolling-window analytics and plot output.
 
-This module implements a closed-loop inference stack with:
-- physical state norm (x, v, B)
-- semantic gate Π(t)
-- control law c(t)
-- bounded gamma-field modulation R_f(t)
-- final stabilized inference scalar I(t)
+Run:
+    python3 inference_core.py --steps 40 --window 5 --plot inference_plot.png
 
-Units/assumptions:
-- x: normalized position state [dimensionless proxy]
-- v: normalized velocity state [dimensionless proxy]
-- B: normalized field magnitude [dimensionless proxy]
-- gamma: sensitivity gain (dimensionless after normalization)
+Dependencies:
+    numpy, pandas, matplotlib
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 from dataclasses import dataclass
-from typing import Dict
+from pathlib import Path
+from typing import Dict, List
 
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(message)s")
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class State:
-    """Physical state for one timestep."""
+class SimulationConfig:
+    """Configuration for the closed-loop simulation.
 
-    x: float
-    v: float
-    B: float
-
-
-@dataclass(frozen=True)
-class Errors:
-    """Control errors for phase/area/coherence channels."""
-
-    theta: float
-    A: float
-    rho: float
-
-
-@dataclass(frozen=True)
-class SemanticConfig:
-    """Semantic gate configuration."""
-
-    dist: float
-    prob_sum: float
-    theta_d: float = 0.3
-    theta_p: float = 1.0
-
-
-@dataclass(frozen=True)
-class GammaParams:
-    """Gamma field parameters.
-
-    gamma: raw gain-like sensitivity term (can be large, will be normalized)
-    mu: centering term for B
-    sigma: scale term for B (must be > 0 for z-score behavior)
+    Assumptions: all variables are dimensionless normalized proxies.
     """
 
-    gamma: float
-    mu: float
-    sigma: float
-    max_gamma: float = 1e9
+    steps: int = 40
+    dt: float = 1.0
+    rolling_window: int = 5
 
 
-def state_norm(state: State) -> float:
-    """Euclidean norm of (x, v, B)."""
-    return float(np.sqrt(state.x**2 + state.v**2 + state.B**2))
+@dataclass
+class RuntimeState:
+    """Mutable runtime state for iterative loop."""
+
+    gamma: float = 8.5e8
+    B: float = 1.0
+    state_norm: float = 1.52
+    Pi: float = 1.0
+
+    theta: float = 0.7
+    theta_star: float = 1.0
+
+    A: float = 0.5
+    A_star: float = 1.0
+
+    rho: float = 0.3
+    rho_star: float = 0.9
+
+    integral_theta: float = 0.0
+    integral_A: float = 0.0
+    prev_error_theta: float = 0.0
+
+    external_control_damping: float = 0.3
 
 
-def semantic_gate(cfg: SemanticConfig) -> float:
-    """Binary robust semantic gate Π(t) in {0,1}."""
-    return 1.0 if (cfg.dist < cfg.theta_d and cfg.prob_sum <= cfg.theta_p) else 0.0
+def saturate(x: float) -> float:
+    """Smooth saturator in [-1, 1]."""
+    return float(np.tanh(x))
 
 
-def control(errors: Errors, kp: float = 0.8, ki: float = 0.1, kd: float = 0.05) -> float:
-    """Simplified PID + coherence correction control law c(t)."""
-    integral = errors.theta
-    derivative = errors.theta
-
-    u_theta = kp * errors.theta + ki * integral + kd * derivative
-    u_A = 0.6 * errors.A
-    u_rho = 0.7 * max(errors.rho, 0.0)
-    return float(u_theta + u_A + u_rho)
+def gamma_eff(gamma: float) -> float:
+    """Bound gamma gain to prevent runaway amplification."""
+    return float(gamma / (1.0 + np.abs(gamma)))
 
 
-def gamma_effective(gamma: float, max_gamma: float = 1e9) -> float:
-    """Normalize gamma to bounded sensitivity weight.
+def phase_lock(
+    theta: float,
+    theta_star: float,
+    integral: float,
+    prev_error: float,
+    kp: float = 0.8,
+    ki: float = 0.1,
+    kd: float = 0.05,
+    dt: float = 1.0,
+) -> tuple[float, float, float]:
+    """PID-like phase-lock block (section-style 6.9 behavior)."""
+    if dt <= 0:
+        raise ValueError("dt must be positive")
 
-    Returns value in approximately [-1, 1] for bounded behavior.
-    """
-    if max_gamma <= 0:
-        raise ValueError("max_gamma must be > 0")
-    return float(gamma / max_gamma)
+    error = theta_star - theta
+    integral += error * dt
+    derivative = (error - prev_error) / dt
 
-
-def fractal_residual_gamma_stable(B: float, params: GammaParams) -> float:
-    """Bounded gamma-modulated residual: tanh(gamma_eff * zscore(B))."""
-    if params.sigma == 0:
-        raise ValueError("sigma must be non-zero for stable z-score normalization")
-
-    z = (B - params.mu) / params.sigma
-    g_eff = gamma_effective(params.gamma, params.max_gamma)
-    return float(np.tanh(g_eff * z))
-
-
-def stabilized_inference(pi: float, c: float, rf: float, s_norm: float) -> float:
-    """Final bounded inference scalar.
-
-    Uses residual attenuation to avoid field domination:
-    I = Π * c * (R_f / (1 + |R_f|)) * ||S||
-    """
-    return float(pi * c * (rf / (1.0 + abs(rf))) * s_norm)
+    u = kp * error + ki * integral + kd * derivative
+    return float(u), float(integral), float(error)
 
 
-def inference_step(
-    state: State,
-    errors: Errors,
-    semantic: SemanticConfig,
-    gamma_params: GammaParams,
-) -> Dict[str, float]:
-    """Run one inference timestep and return all intermediate scalars."""
-    pi = semantic_gate(semantic)
-    c = control(errors)
-    rf = fractal_residual_gamma_stable(state.B, gamma_params)
-    s_norm = state_norm(state)
-    inference = stabilized_inference(pi, c, rf, s_norm)
+def amplitude_control(A: float, A_star: float, integral: float, dt: float = 1.0, GA: float = 0.6, HA: float = 0.2) -> tuple[float, float]:
+    """Amplitude regulator (section-style 6.10 behavior)."""
+    if dt <= 0:
+        raise ValueError("dt must be positive")
+
+    e = A_star - A
+    integral += e * dt
+    return float(GA * e + HA * integral), float(integral)
+
+
+def coherence_control(rho: float, rho_star: float, G: float = 0.9) -> float:
+    """Coherence regulator (section-style 6.11 behavior)."""
+    e = rho_star - rho
+    return float(G * max(e, 0.0))
+
+
+def step(state: RuntimeState, dt: float = 1.0) -> Dict[str, float]:
+    """Single closed-loop timestep with bounded inference output."""
+    # gamma stabilization + exogenous damping term
+    g = gamma_eff(state.gamma)
+    g = g * (1.0 - state.external_control_damping)
+
+    # control channels
+    u_theta, state.integral_theta, state.prev_error_theta = phase_lock(
+        state.theta,
+        state.theta_star,
+        state.integral_theta,
+        state.prev_error_theta,
+        dt=dt,
+    )
+    u_A, state.integral_A = amplitude_control(state.A, state.A_star, state.integral_A, dt=dt)
+    u_rho = coherence_control(state.rho, state.rho_star)
+
+    # unified control, clipped for safety
+    c = float(np.clip(u_theta + u_A + u_rho, -1.0, 1.0))
+
+    # gamma-field coupling + bounded inference
+    gamma_field = g * (1.0 - c)
+    raw = gamma_field * state.B * state.state_norm * state.Pi
+    inference = saturate(raw)
+
+    # toy evolution (satellite-style iterative dynamics)
+    state.theta += 0.01 * c
+    state.A += 0.02 * (state.A_star - state.A)
+    state.rho += 0.01 * (state.rho_star - state.rho)
 
     return {
-        "Pi": pi,
         "control": c,
-        "gamma_field": rf,
-        "state_norm": s_norm,
+        "gamma_field": float(gamma_field),
+        "raw": float(raw),
         "inference": inference,
+        "theta": float(state.theta),
+        "A": float(state.A),
+        "rho": float(state.rho),
+        "B": float(state.B),
+        "Pi": float(state.Pi),
+        "state_norm": float(state.state_norm),
     }
 
 
-def _sanity_checks(output: Dict[str, float]) -> None:
-    """Basic runtime validations for physical/numerical limits."""
-    if not (-1.0 <= output["gamma_field"] <= 1.0):
-        raise RuntimeError("gamma_field out of bounded range [-1, 1]")
-    if not np.isfinite(output["inference"]):
-        raise RuntimeError("inference is not finite")
+def run_simulation(config: SimulationConfig, runtime: RuntimeState) -> pd.DataFrame:
+    """Run simulation loop and return DataFrame for analysis."""
+    if config.steps <= 0:
+        raise ValueError("steps must be > 0")
+    if config.rolling_window <= 0:
+        raise ValueError("rolling_window must be > 0")
+
+    rows: List[Dict[str, float]] = []
+    for t in range(1, config.steps + 1):
+        out = step(runtime, dt=config.dt)
+        out["t"] = t
+        rows.append(out)
+        LOGGER.info(
+            "[t=%02d] B=%.3f | R=%.3f | γ=%.3e | inf=%.5f",
+            t,
+            out["B"],
+            out["control"],
+            out["gamma_field"],
+            out["inference"],
+        )
+
+    df = pd.DataFrame(rows)
+
+    # Required user-specific analytics: rolling window average of column X.
+    # We define X := inference as primary scalar output.
+    df["X"] = df["inference"]
+    df["X_roll_mean"] = df["X"].rolling(window=config.rolling_window, min_periods=1).mean()
+
+    # Basic sanity checks.
+    if (df["inference"].abs() > 1.0).any():
+        raise RuntimeError("Inference escaped bounded range [-1, 1]")
+    if not np.isfinite(df["gamma_field"]).all():
+        raise RuntimeError("Non-finite gamma_field detected")
+
+    return df
+
+
+def save_plot(df: pd.DataFrame, output_path: Path) -> None:
+    """Save inference and rolling average plot to disk."""
+    plt.figure(figsize=(10, 5))
+    plt.plot(df["t"], df["X"], label="X (inference)", linewidth=1.8)
+    plt.plot(df["t"], df["X_roll_mean"], label="Rolling mean(X)", linewidth=2.2)
+    plt.xlabel("Timestep")
+    plt.ylabel("Normalized scalar")
+    plt.title("Bounded Inference and Rolling-Window Mean")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+def parse_args() -> argparse.Namespace:
+    """CLI argument parser."""
+    parser = argparse.ArgumentParser(description="Run stabilized primal logic inference simulation.")
+    parser.add_argument("--steps", type=int, default=40, help="Number of simulation timesteps.")
+    parser.add_argument("--dt", type=float, default=1.0, help="Timestep duration (s, normalized).")
+    parser.add_argument("--window", type=int, default=5, help="Rolling window size n for column X.")
+    parser.add_argument("--plot", type=Path, default=Path("inference_plot.png"), help="Output PNG path.")
+    parser.add_argument("--csv", type=Path, default=Path("inference_timeseries.csv"), help="Output CSV path.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    """CLI entrypoint."""
+    args = parse_args()
+    config = SimulationConfig(steps=args.steps, dt=args.dt, rolling_window=args.window)
+    runtime = RuntimeState()
+
+    df = run_simulation(config, runtime)
+    df.to_csv(args.csv, index=False)
+    save_plot(df, args.plot)
+
+    LOGGER.info("Saved CSV: %s", args.csv)
+    LOGGER.info("Saved plot: %s", args.plot)
+    LOGGER.info("Final inference=%.5f, rolling_mean=%.5f", df["X"].iloc[-1], df["X_roll_mean"].iloc[-1])
 
 
 if __name__ == "__main__":
-    test_state = State(x=0.5, v=1.2, B=0.8)
-    test_errors = Errors(theta=0.25, A=0.4, rho=0.3)
-    test_semantic = SemanticConfig(dist=0.2, prob_sum=0.7)
-    test_gamma = GammaParams(gamma=2.675e8, mu=1.0, sigma=0.25)
-
-    result = inference_step(test_state, test_errors, test_semantic, test_gamma)
-    _sanity_checks(result)
-
-    logging.info("=== INFERENCE OUTPUT (STABILIZED) ===")
-    for key, val in result.items():
-        logging.info("%s: %s", key, val)
+    main()
